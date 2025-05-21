@@ -1,7 +1,7 @@
 import threading
 from uuid import uuid4
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, APIRouter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -13,8 +13,10 @@ from app.db.database import get_session
 from main import queue_lock, task_queue, task_status, app
 from app.db.models import Summary
 
+router = APIRouter()
 
-@app.post("/summarize")
+
+@router.post("/summarize")
 async def queue_summary_task(request: URLRequest, session: AsyncSession = Depends(get_session)):
     log.info(f"📥 New request for URL: {request.url}")
     result = await session.execute(select(Summary).where(Summary.url == request.url))
@@ -51,7 +53,7 @@ async def queue_summary_task(request: URLRequest, session: AsyncSession = Depend
     return {"request_id": request_id}
 
 
-@app.get("/status/{request_id}", response_model=StatusResponse)
+@router.get("/status/{request_id}", response_model=StatusResponse)
 def get_status(request_id: str):
     if request_id not in task_status:
         raise HTTPException(status_code=404, detail="Request not found")

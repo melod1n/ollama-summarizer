@@ -2,11 +2,9 @@ import os
 from logging.handlers import RotatingFileHandler
 
 import logging
+from app.core.config import LOG_PATH
 
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "summary.log")
-
-os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
 
 def setup_logger(name: str = "summary_logger") -> logging.Logger:
@@ -16,7 +14,7 @@ def setup_logger(name: str = "summary_logger") -> logging.Logger:
     if not logger.handlers:
         formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-        handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+        handler = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3)
         handler.setFormatter(formatter)
 
         logger.addHandler(handler)
