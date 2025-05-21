@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -14,3 +14,5 @@ class Summary(Base):
     result = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    duration_sec = Column(Float, nullable=True)
+    total_tokens = Column(Integer, nullable=True)

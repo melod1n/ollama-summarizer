@@ -2,15 +2,16 @@ import asyncio
 import json
 import os
 import threading
+import logging
 from typing import List, Dict
 from uuid import uuid4
+from time import time
 
 import requests
 import tiktoken
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import Depends
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from readability import Document
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,8 +31,11 @@ MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", 5))
 app = FastAPI()
 encoding = tiktoken.get_encoding("cl100k_base")
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
 task_queue: List[str] = []
-task_status: Dict[str, Dict] = {}  # { request_id: { status, result?, error? } }
+task_status: Dict[str, Dict] = {}
 queue_lock = threading.Lock()
 
 
@@ -47,24 +51,26 @@ class StatusResponse(BaseModel):
 
 @app.on_event("startup")
 async def on_startup():
+    log.info("🟢 Backend started")
+    log.info(f"Settings: OLLAMA_API_URL={OLLAMA_API_URL}, MODEL_NAME={MODEL_NAME}, MAX_TOKENS={MAX_TOKENS}, MAX_QUEUE_SIZE={MAX_QUEUE_SIZE}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
 @app.post("/summarize")
 async def queue_summary_task(request: URLRequest, session: AsyncSession = Depends(get_session)):
-    # Проверка: не был ли уже обработан
+    log.info(f"📥 New request for URL: {request.url}")
     result = await session.execute(select(Summary).where(Summary.url == request.url))
     existing = result.scalar_one_or_none()
 
     if existing and existing.status == "success":
-        raise HTTPException(status_code=409, detail="This URL has already been processed successfully.")
+        log.info(f"⚠️ URL already successfully processed and result will be replaced: {request.url}")
 
     request_id = str(uuid4())
 
-    # Добавим в очередь
     with queue_lock:
         if len(task_queue) >= MAX_QUEUE_SIZE:
+            log.warning(f"🚫 Queue full. Rejected URL: {request.url}")
             raise HTTPException(status_code=429, detail="Queue is full. Try again later.")
 
         task_queue.append(request_id)
@@ -73,7 +79,6 @@ async def queue_summary_task(request: URLRequest, session: AsyncSession = Depend
             "request": {"url": request.url}
         }
 
-    # Обновим/создадим запись в БД
     if not existing:
         new_entry = Summary(url=request.url, status="in_progress")
         session.add(new_entry)
@@ -83,8 +88,7 @@ async def queue_summary_task(request: URLRequest, session: AsyncSession = Depend
         existing.error = None
 
     await session.commit()
-
-    # Запуск фоновой задачи
+    log.info(f"🟡 Added to queue: request_id={request_id}, url={request.url}")
     threading.Thread(target=process_queue_item, args=(request_id,), daemon=True).start()
 
     return {"request_id": request_id}
@@ -100,16 +104,13 @@ def get_status(request_id: str):
 
     if status == "in_progress":
         return StatusResponse(status="in_progress")
-
     if status == "success":
         return StatusResponse(status="success", result=entry.get("result"))
-
     return StatusResponse(status="failure", error=entry.get("error"))
 
 
 def process_queue_item(request_id: str):
     url = task_status[request_id]["request"]["url"]
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_process_and_save(url, request_id))
@@ -119,18 +120,25 @@ def process_queue_item(request_id: str):
 async def _process_and_save(url: str, request_id: str):
     from database import async_session
     async with async_session() as session:
+        start_time = time()
+        log.info(f"⚙️ Start processing: request_id={request_id}, url={url}")
+
         try:
             text = fetch_and_clean_html(url)
             prompt = build_prompt(text)
             tokens = len(encoding.encode(prompt))
+            log.info(f"⚙️ Total symbols: {len(text)}, tokens: {len(encoding.encode(text))}, prompt tokens: {tokens}")
 
             if tokens > MAX_TOKENS:
                 chunks = chunk_text(text, max_tokens=1500, overlap=200)
                 summaries = []
                 all_tags_list = []
-                for chunk in chunks:
+                for idx, chunk in enumerate(chunks):
+                    log.info(f"🧩 Chunk #{idx + 1} (symbols={len(chunk)}, tokens={len(encoding.encode(chunk))}):\n{chunk[:500]}...")
+                    chunk_start_time = time()
                     chunk_prompt = build_prompt(chunk)
                     chunk_result = call_ollama(chunk_prompt)
+                    log.info(f"📨 LLM response for chunk #{idx + 1} (took {round(time() - chunk_start_time, 2)}s):\n{chunk_result}")
                     parsed = try_parse_result(chunk_result)
                     if "summary" in parsed:
                         summaries.append(parsed["summary"])
@@ -147,6 +155,7 @@ async def _process_and_save(url: str, request_id: str):
                 }
             else:
                 result = call_ollama(prompt)
+                log.info(f"📨 LLM response (single chunk):\n{result}")
                 parsed = try_parse_result(result)
                 final_result = {"url": url, **parsed}
 
@@ -157,22 +166,26 @@ async def _process_and_save(url: str, request_id: str):
             entry = row.scalar_one()
             entry.status = "success"
             entry.result = json.dumps(final_result)
+            entry.duration_sec = round(time() - start_time, 2)
+            entry.total_tokens = tokens
             await session.commit()
+            log.info(f"✅ Success: request_id={request_id}, url={url}, duration={entry.duration_sec} sec")
 
         except Exception as e:
             task_status[request_id]["status"] = "failure"
             task_status[request_id]["error"] = str(e)
-
             row = await session.execute(select(Summary).where(Summary.url == url))
             entry = row.scalar_one()
             entry.status = "failure"
             entry.error = str(e)
             await session.commit()
+            log.error(f"❌ Error processing request_id={request_id}, url={url}: {e}")
 
         finally:
             with queue_lock:
                 if request_id in task_queue:
                     task_queue.remove(request_id)
+            log.info(f"🧹 Finished processing: request_id={request_id}")
 
 
 def fetch_and_clean_html(url: str) -> str:
@@ -190,20 +203,19 @@ def build_prompt(text: str) -> str:
 
     Given the following raw HTML of an article:
     1. Write a **concise topic-style summary** in **one English sentence** that reflects the article's subject.
-       - Do **not** start with phrases like "This article discusses..." or "The article explains...".
+       - Do **not** start with phrases like \"This article discusses...\" or \"The article explains...\".
        - Make it a **clear, compact statement** of the main idea.
-       - Example: "Best practices for handling display cutouts in Android edge-to-edge layouts."
-    2. Generate **5 to 10 general-topic tags**, written in **English**, lowercase, and **hyphenated** (e.g. `"android"`, `"mobile-development"`, `"user-interface"`).
+       - Example: \"Best practices for handling display cutouts in Android edge-to-edge layouts.\"
+    2. Generate **5 to 10 general-topic tags**, written in **English**, lowercase, and **hyphenated** (e.g. \"android\", \"mobile-development\", \"user-interface\").
        - Tags must describe the **overall subject area**, not specific technologies or methods.
-       - Avoid concrete APIs or libraries (e.g. no `"recyclerview"`, `"compose"`).
-       - Prefer broad tags like `"android"`, `"mobile-ui"`, `"design-principles"`, `"user-experience"`.
+       - Avoid concrete APIs or libraries (e.g. no \"recyclerview\", \"compose\").
+       - Prefer broad tags like \"android\", \"mobile-ui\", \"design-principles\", \"user-experience\".
 
     Return the result only as valid JSON object, without wrapping it in markdown, code block, or any additional formatting. Just plain JSON. Like this:
     {{
       "summary": "...",
       "tags": ["...", "..."]
     }}
-
 
     Here is the HTML:
     {text}
@@ -243,29 +255,20 @@ def summarize_chunk_summaries(summaries: list[str]) -> str:
         return "No summaries available."
     if len(summaries) == 1:
         return summaries[0]
-
     unique_summaries = list(dict.fromkeys(summaries))
-
     joined = " ".join(unique_summaries)
-
-    prompt = f"""Summarize the following partial summaries into one single coherent summary (in one English sentence):
-
-{joined}
-"""
-
+    prompt = f"""Summarize the following partial summaries into one single coherent summary (in one English sentence):\n\n{joined}"""
     raw = call_ollama(prompt)
     final = try_parse_result(raw)
-
     summary = final.get("summary")
     if summary and len(summary) < 500:
         return summary
-
     return joined[:500].rsplit(".", 1)[0] + "..."
+
 
 def filter_tags_via_llm(tag_lists: list[list[str]]) -> list[str]:
     flat_tags = [tag.strip().lower() for tags in tag_lists for tag in tags]
     unique_tags = sorted(set(flat_tags))
-
     prompt = f"""You are a text categorization assistant.
 
 Here is a list of tags extracted from different parts of an article. They may contain duplicates, synonyms, or overly specific variations.
@@ -274,7 +277,7 @@ Your task is to:
 - return **no more than 10** general-topic tags.
 - remove tags that are too specific or repetitive in meaning.
 - prefer broad, meaningful categories over concrete tools or libraries.
-- keep the tags **in lowercase** and **hyphenated** (e.g. "machine-learning", "language-models").
+- keep the tags **in lowercase** and **hyphenated** (e.g. \"machine-learning\", \"language-models\").
 
 Tags:
 {json.dumps(unique_tags, indent=2)}
@@ -282,13 +285,11 @@ Tags:
 Return the result as a valid JSON array, like this:
 ["tag-one", "tag-two", "tag-three"]
 """
-
-    raw = call_ollama(prompt)
+    raw = call_ollama(prompt).strip('"').strip('```json').strip('```').strip()
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list) and all(isinstance(tag, str) for tag in parsed):
             return parsed[:10]
-    except Exception:
-        pass
-
+    except Exception as e:
+        log.warning(f"⚠️ Failed to parse tag response from LLM: {e}\nRaw: {raw}")
     return unique_tags[:10]
