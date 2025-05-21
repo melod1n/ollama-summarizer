@@ -25,8 +25,10 @@ load_dotenv()
 
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generate")
 MODEL_NAME = os.getenv("MODEL_NAME", "mistral")
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "7500"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", 6000))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", 5))
+CHUNK_MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", 1500))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 200))
 
 app = FastAPI()
 encoding = tiktoken.get_encoding("cl100k_base")
@@ -52,7 +54,8 @@ class StatusResponse(BaseModel):
 @app.on_event("startup")
 async def on_startup():
     log.info("🟢 Backend started")
-    log.info(f"Settings: OLLAMA_API_URL={OLLAMA_API_URL}, MODEL_NAME={MODEL_NAME}, MAX_TOKENS={MAX_TOKENS}, MAX_QUEUE_SIZE={MAX_QUEUE_SIZE}")
+    log.info(
+        f"Settings: OLLAMA_API_URL={OLLAMA_API_URL}, MODEL_NAME={MODEL_NAME}, MAX_TOKENS={MAX_TOKENS}, MAX_QUEUE_SIZE={MAX_QUEUE_SIZE}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -130,15 +133,17 @@ async def _process_and_save(url: str, request_id: str):
             log.info(f"⚙️ Total symbols: {len(text)}, tokens: {len(encoding.encode(text))}, prompt tokens: {tokens}")
 
             if tokens > MAX_TOKENS:
-                chunks = chunk_text(text, max_tokens=1500, overlap=200)
+                chunks = chunk_text(text, max_tokens=CHUNK_MAX_TOKENS, overlap=CHUNK_OVERLAP)
                 summaries = []
                 all_tags_list = []
                 for idx, chunk in enumerate(chunks):
-                    log.info(f"🧩 Chunk #{idx + 1} (symbols={len(chunk)}, tokens={len(encoding.encode(chunk))}):\n{chunk[:500]}...")
+                    log.info(
+                        f"🧩 Chunk #{idx + 1} (symbols={len(chunk)}, tokens={len(encoding.encode(chunk))}):\n{chunk[:500]}...")
                     chunk_start_time = time()
                     chunk_prompt = build_prompt(chunk)
                     chunk_result = call_ollama(chunk_prompt)
-                    log.info(f"📨 LLM response for chunk #{idx + 1} (took {round(time() - chunk_start_time, 2)}s):\n{chunk_result}")
+                    log.info(
+                        f"📨 LLM response for chunk #{idx + 1} (took {round(time() - chunk_start_time, 2)}s):\n{chunk_result}")
                     parsed = try_parse_result(chunk_result)
                     if "summary" in parsed:
                         summaries.append(parsed["summary"])

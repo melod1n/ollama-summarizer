@@ -1,7 +1,7 @@
 import tiktoken
 
 
-def chunk_text(text: str, max_tokens: int = 1500, overlap: int = 200):
+def chunk_text(text: str, max_tokens: int, overlap: int):
     encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
 
