@@ -2,7 +2,7 @@ from main import encoding
 
 
 def chunk_text(text: str, max_tokens: int, overlap: int):
-    tokens = encoding.encode(text)
+    tokens = encoding.encode(text, disallowed_special=())
 
     chunks = []
     start = 0

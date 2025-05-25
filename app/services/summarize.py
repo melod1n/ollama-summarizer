@@ -58,7 +58,7 @@ async def _process_and_save(url: str, request_id: str):
         try:
             text = fetch_and_clean_html(url)
             prompt = build_prompt(text)
-            tokens = len(encoding.encode(prompt))
+            tokens = len(encoding.encode(prompt, disallowed_special=()))
             log.info(f"⚙️ Total symbols: {len(text)}, tokens: {len(encoding.encode(text))}, prompt tokens: {tokens}")
 
             if tokens > MAX_TOKENS:
