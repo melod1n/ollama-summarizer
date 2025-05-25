@@ -1,9 +1,11 @@
 import asyncio
 import json
+import re
 from time import time
 
 import requests
 from bs4 import BeautifulSoup
+from fastapi import HTTPException
 from readability import Document
 from sqlalchemy.future import select
 
@@ -30,7 +32,61 @@ def fetch_and_clean_html(url: str) -> str:
     doc = Document(html)
     cleaned_html = doc.summary()
     soup = BeautifulSoup(cleaned_html, "html.parser")
-    return soup.get_text(strip=True)
+    text = soup.get_text(strip=True)
+
+    if not is_article(text):
+        if not is_article_llm(text):
+            raise HTTPException(status_code=400, detail="The provided URL does not contain a valid article.")
+
+    return text
+
+
+def is_article(text: str) -> bool:
+    text = text.strip()
+
+    if len(text) < 500:
+        return False
+
+    sentences = re.split(r'[.!?]', text)
+    long_sentences = [s for s in sentences if len(s.strip().split()) > 6]
+    if len(long_sentences) < 5:
+        return False
+
+    lower = text.lower()
+    if any(term in lower for term in
+           ["404", "page not found", "not found", "cookies", "consent", "login required", "sign in to continue"]):
+        return False
+
+    return True
+
+
+def build_is_article_prompt(text: str) -> str:
+    return f"""You are a web content classifier.
+
+Determine whether the following page is a real article or not. An article should be at least one paragraph long, written in natural language, and contain meaningful content.
+
+Only respond with a single word: "yes" or "no".
+
+Here is the content:
+
+{text[:2000]}"""
+
+
+def is_article_llm(text: str) -> bool:
+    prompt = build_is_article_prompt(text)
+    log.info(f"[is_article_llm] Prompt:\n{prompt[:500]}...")
+
+    try:
+        response = call_ollama(prompt).strip().lower()
+        log.info(f"[is_article_llm] LLM response: '{response}'")
+
+        is_article = response.startswith("y")
+        log.info(f"[is_article_llm] Final decision: {is_article}")
+        return is_article
+
+    except Exception as e:
+        log.error(f"[is_article_llm] Error during LLM check: {e}")
+        return False
 
 
 def summarize_chunk_summaries(summaries: list[str]) -> str:
